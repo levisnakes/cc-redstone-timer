@@ -1,8 +1,8 @@
 -- Tree Farm Timer: runs a machine that parks on a redstone contact and shows
 -- harvest stats on a monitor.
 -- While parked, PARKED_SIDE is on. The timer turns OUTPUT_SIDE on and holds it
--- until the machine leaves the contact and comes back. Then it waits for the
--- harvest to finish unloading into the vault before starting the next
+-- while the machine leaves the contact, comes back, and the harvest unloads
+-- into the vault. Once unloading stops it turns the output off and starts the next
 -- INTERVAL_MINUTES countdown. If nothing arrives within UNLOAD_TIMEOUT_MINUTES,
 -- it runs the machine again.
 
@@ -143,7 +143,6 @@ local function startRun()
 end
 
 local function finishRun()
-  rs.setOutput(OUTPUT_SIDE, false)
   if runStartedAt then
     state.lastRunSeconds = now() - runStartedAt
     state.cycles = state.cycles + 1
@@ -164,6 +163,8 @@ end
 -- nothing arrived within the timeout. A force start ends the wait early.
 local function waitForUnload()
   phase = "unloading"
+  -- The output stays on while the harvest unloads.
+  rs.setOutput(OUTPUT_SIDE, true)
   scanVault()
   unload = { since = now(), peak = vault.total, started = false, lastUp = now() }
   if not vault.ok then return true end
@@ -191,11 +192,14 @@ local function afterRun()
   if state.runStartTotal then
     state.lastGain = math.max(0, unload.peak - state.runStartTotal)
   end
+  rs.setOutput(OUTPUT_SIDE, false)
   if unloaded then
     state.nextAt = now() + INTERVAL_MINUTES * 60
   else
     state.reruns = state.reruns + 1
     state.nextAt = now()
+    -- Brief off gap so the re-run starts on a fresh signal
+    sleep(1)
   end
   state.unloading = false
   phase = "parked"
@@ -209,7 +213,6 @@ local function timerLoop()
     phase = "running"
     rs.setOutput(OUTPUT_SIDE, true)
     waitForPark()
-    rs.setOutput(OUTPUT_SIDE, false)
     state.unloading = true
   end
   if state.unloading then
