@@ -32,6 +32,7 @@ local state = {
 
 local phase = "parked"
 local runStartedAt = nil
+local forceRequested = false
 
 local function load()
   if not fs.exists(SAVE) then return end
@@ -164,17 +165,26 @@ local function timerLoop()
   end
 
   while true do
-    if now() >= state.nextAt then
+    if forceRequested or now() >= state.nextAt then
+      forceRequested = false
       startRun()
       while parked() do os.pullEvent("redstone") end
       waitForPark()
       finishRun()
+      forceRequested = false
     else
       local timer = os.startTimer(1)
       repeat
         local ev, id = os.pullEvent()
-      until ev == "redstone" or (ev == "timer" and id == timer)
+      until ev == "redstone" or ev == "force_start" or (ev == "timer" and id == timer)
     end
+  end
+end
+
+local function forceStart()
+  if phase == "parked" then
+    forceRequested = true
+    os.queueEvent("force_start")
   end
 end
 
@@ -193,13 +203,14 @@ local function fmtNum(n)
   return tostring(math.floor(n))
 end
 
+-- Returns badge label, caption, time string, and interval progress (nil while running).
 local function status()
   if phase == "running" then
-    return "HARVESTING", "Running for " .. fmtTime(now() - (runStartedAt or now())), nil
+    return "HARVESTING", "Running for", fmtTime(now() - (runStartedAt or now())), nil
   end
   local left = (state.nextAt or now()) - now()
   local frac = 1 - left / (INTERVAL_MINUTES * 60)
-  return "PARKED", "Next harvest in " .. fmtTime(left), math.max(0, math.min(1, frac))
+  return "PARKED", "Next harvest in", fmtTime(left), math.max(0, math.min(1, frac))
 end
 
 local function statLines()
@@ -214,6 +225,7 @@ end
 -- DirectGPU renderer (full RGB). Returns false if it can't draw, so the
 -- caller can fall back to the plain monitor.
 local gpu, display, W, H
+local useGpuInput = false
 
 local FONT = "SansSerif"
 local BG = { 16, 18, 22 }
@@ -223,6 +235,8 @@ local WHITE = { 235, 238, 242 }
 local GREEN = { 60, 190, 90 }
 local AMBER = { 240, 170, 50 }
 local TRACK = { 50, 56, 66 }
+local WEDGE = { 40, 105, 60 }
+local RED = { 200, 70, 60 }
 
 local function setupGpu()
   gpu = peripheral.find("directgpu")
@@ -258,6 +272,66 @@ local function bar(x, y, w, h, frac, c)
   rect(x, y, w * math.max(0, math.min(1, frac)), h, c)
 end
 
+local function line(x1, y1, x2, y2, c)
+  gpu.drawLine(display, math.floor(x1), math.floor(y1), math.floor(x2), math.floor(y2), c[1], c[2], c[3])
+end
+
+-- Thick line: a few parallel lines offset sideways.
+local function thickLine(x1, y1, x2, y2, width, c)
+  local dx, dy = x2 - x1, y2 - y1
+  local len = math.sqrt(dx * dx + dy * dy)
+  if len == 0 then return end
+  local nx, ny = -dy / len, dx / len
+  for o = -width / 2, width / 2, 0.5 do
+    line(x1 + nx * o, y1 + ny * o, x2 + nx * o, y2 + ny * o, c)
+  end
+end
+
+local function circle(cx, cy, r, c, filled)
+  gpu.drawCircle(display, math.floor(cx), math.floor(cy), math.floor(r), c[1], c[2], c[3], filled)
+end
+
+-- Angle for a fraction of a full turn, starting at 12 o'clock, clockwise.
+local function clockPoint(cx, cy, r, frac)
+  local a = frac * 2 * math.pi - math.pi / 2
+  return cx + math.cos(a) * r, cy + math.sin(a) * r
+end
+
+-- Analog clock: the shaded wedge and hand show how far through the
+-- interval we are. While harvesting, the hand sweeps continuously.
+local function drawClock(cx, cy, r, frac)
+  circle(cx, cy, r, PANEL, true)
+
+  local handFrac, handColor
+  if frac then
+    -- Elapsed wedge, drawn as radial lines (one per pixel of arc).
+    local steps = math.max(1, math.floor(2 * math.pi * r * frac))
+    for i = 0, steps do
+      local x, y = clockPoint(cx, cy, r - 2, frac * i / steps)
+      line(cx, cy, x, y, WEDGE)
+    end
+    handFrac, handColor = frac, WHITE
+  else
+    handFrac, handColor = (now() / 4) % 1, AMBER
+  end
+
+  for i = 0, 11 do
+    local inner = (i % 3 == 0) and 0.78 or 0.86
+    local x1, y1 = clockPoint(cx, cy, r * inner, i / 12)
+    local x2, y2 = clockPoint(cx, cy, r * 0.95, i / 12)
+    thickLine(x1, y1, x2, y2, (i % 3 == 0) and 2 or 1, MUTED)
+  end
+  circle(cx, cy, r, MUTED, false)
+  circle(cx, cy, r - 1, MUTED, false)
+
+  local hx, hy = clockPoint(cx, cy, r * 0.75, handFrac)
+  thickLine(cx, cy, hx, hy, math.max(2, r / 15), handColor)
+  circle(cx, cy, math.max(2, r / 10), handColor, true)
+end
+
+-- Force start button position, in display pixels; set each frame.
+local button = nil
+
 local function drawGpu()
   local pad = math.max(4, math.floor(W * 0.03))
   local small = math.max(8, math.floor(H * 0.055))
@@ -270,27 +344,31 @@ local function drawGpu()
   local headH = medium + pad * 2
   rect(0, 0, W, headH, PANEL)
   text(TITLE, pad, pad, WHITE, medium, "bold")
-  local label, line, frac = status()
+  local label, caption, timeStr, frac = status()
   local pillColor = phase == "running" and AMBER or GREEN
   local pillW = textWidth(label, small, "bold") + pad * 2
   local pillH = small + pad
   rect(W - pad - pillW, (headH - pillH) / 2, pillW, pillH, pillColor)
   text(label, W - pad - pillW + pad, (headH - pillH) / 2 + pad / 2, BG, small, "bold")
 
-  -- Countdown and interval progress
+  -- Clock on the left; countdown and force start button beside it
   local y = headH + pad
-  text(line, pad, y, WHITE, big, "bold")
-  y = y + big + pad / 2
-  if frac then
-    bar(pad, y, W - pad * 2, math.max(3, pad / 2), frac, GREEN)
-  else
-    -- Moving stripe while the machine runs
-    local w = W - pad * 2
-    rect(pad, y, w, math.max(3, pad / 2), TRACK)
-    local pos = (now() * 0.5) % 1
-    rect(pad + pos * w * 0.75, y, w * 0.25, math.max(3, pad / 2), AMBER)
-  end
-  y = y + math.max(3, pad / 2) + pad
+  local r = math.floor(math.min(W * 0.16, H * 0.17))
+  drawClock(pad + r, y + r, r, frac)
+
+  local tx = pad + r * 2 + pad * 1.5
+  text(caption, tx, y, MUTED, small)
+  text(timeStr, tx, y + small + pad / 4, WHITE, big, "bold")
+
+  local btnLabel = phase == "running" and "RUNNING..." or "FORCE START"
+  local bw = textWidth(btnLabel, small, "bold") + pad * 2
+  local bh = small + pad
+  local bx, by = tx, y + r * 2 - bh
+  rect(bx, by, bw, bh, phase == "running" and TRACK or RED)
+  text(btnLabel, bx + pad, by + pad / 2, phase == "running" and MUTED or WHITE, small, "bold")
+  button = { x = bx, y = by, w = bw, h = bh }
+
+  y = y + r * 2 + pad
 
   -- Stat cards
   local stats = statLines()
@@ -332,6 +410,8 @@ local function drawGpu()
   gpu.updateDisplay(display)
 end
 
+local plainButtonRow = nil
+
 -- Plain monitor fallback when there's no DirectGPU block.
 local function drawPlain()
   local mon = peripheral.wrap(MONITOR)
@@ -345,11 +425,23 @@ local function drawPlain()
     mon.setTextColour(c or colours.white)
     mon.write(s)
   end
-  local label, l, _ = status()
+  local label, caption, timeStr = status()
   line(1, TITLE)
   line(2, label, phase == "running" and colours.orange or colours.lime)
-  line(3, l)
-  local y = 5
+  line(3, caption .. " " .. timeStr)
+  mon.setCursorPos(2, 4)
+  if phase == "running" then
+    mon.setBackgroundColour(colours.grey)
+    mon.setTextColour(colours.lightGrey)
+    mon.write(" RUNNING... ")
+  else
+    mon.setBackgroundColour(colours.red)
+    mon.setTextColour(colours.white)
+    mon.write(" FORCE START ")
+  end
+  mon.setBackgroundColour(colours.black)
+  plainButtonRow = 4
+  local y = 6
   for _, s in ipairs(statLines()) do
     line(y, s[1] .. ": " .. s[2])
     y = y + 1
@@ -369,14 +461,16 @@ end
 local gpuError = nil
 
 local function drawTerminal()
-  local label, line = status()
+  local label, caption, timeStr = status()
   term.clear()
   term.setCursorPos(1, 1)
   print(TITLE .. " timer")
   print("")
-  print(label .. ": " .. line)
+  print(label .. ": " .. caption .. " " .. timeStr)
   print("")
   for _, s in ipairs(statLines()) do print(s[1] .. ": " .. s[2]) end
+  print("")
+  print("Press F or tap FORCE START to start now")
   if gpuError then
     print("")
     if term.isColour() then term.setTextColour(colours.orange) end
@@ -392,6 +486,7 @@ local function displayLoop()
   local retryAt = now() + 30
   if not useGpu then gpuError = "no DirectGPU block found, using plain monitor" end
   while true do
+    useGpuInput = useGpu
     if useGpu then
       local ok, err = pcall(drawGpu)
       if ok then
@@ -414,6 +509,39 @@ local function displayLoop()
   end
 end
 
+local function inButton(x, y)
+  return button and x >= button.x and x <= button.x + button.w
+    and y >= button.y and y <= button.y + button.h
+end
+
+-- Force start from the F key, a tap on the plain monitor, or a click on
+-- the DirectGPU display.
+local function inputLoop()
+  while true do
+    local timer = os.startTimer(0.1)
+    local ev = { os.pullEvent() }
+    if ev[1] == "key" and ev[2] == keys.f then
+      forceStart()
+    elseif ev[1] == "monitor_touch" and ev[2] == MONITOR then
+      if useGpuInput and W then
+        local mw, mh = peripheral.call(MONITOR, "getSize")
+        if inButton((ev[3] - 0.5) / mw * W, (ev[4] - 0.5) / mh * H) then forceStart() end
+      elseif ev[4] == plainButtonRow then
+        forceStart()
+      end
+    end
+    if useGpuInput and gpu and display then
+      local ok, has = pcall(gpu.hasEvents, display)
+      while ok and has do
+        local e = gpu.pollEvent(display)
+        if e and e.type == "mouse_click" and inButton(e.x, e.y) then forceStart() end
+        ok, has = pcall(gpu.hasEvents, display)
+      end
+    end
+    if ev[1] ~= "timer" or ev[2] ~= timer then os.cancelTimer(timer) end
+  end
+end
+
 load()
 scanVault()
-parallel.waitForAny(timerLoop, vaultLoop, displayLoop)
+parallel.waitForAny(timerLoop, vaultLoop, displayLoop, inputLoop)
