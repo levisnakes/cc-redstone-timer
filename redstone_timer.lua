@@ -9,7 +9,7 @@
 INTERVAL_MINUTES = 5
 UNLOAD_TIMEOUT_MINUTES = 10
 -- Unloading counts as done once the vault hasn't gone up for this long
-SETTLE_SECONDS = 30
+SETTLE_SECONDS = 10
 OUTPUT_SIDE = "back"
 PARKED_SIDE = "top"
 
