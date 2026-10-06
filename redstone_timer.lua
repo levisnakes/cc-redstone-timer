@@ -1,10 +1,15 @@
--- Redstone Timer: pulses OUTPUT_SIDE every INTERVAL_MINUTES.
--- A signal on STOP_SIDE stops it; the countdown restarts once that signal turns off.
+-- Redstone Timer for a machine that parks on a redstone contact.
+-- While parked, PARKED_SIDE is on. Every INTERVAL_MINUTES the timer pulses
+-- OUTPUT_SIDE to start the machine, waits for it to leave (signal off) and
+-- come back (signal on), then starts the next countdown.
 
 INTERVAL_MINUTES = 18
 PULSE_SECONDS = 1
 OUTPUT_SIDE = "back"
-STOP_SIDE = "top"
+PARKED_SIDE = "top"
+
+-- If the machine hasn't left the contact this many seconds after a pulse, pulse again.
+RETRY_SECONDS = 10
 
 
 -- The next pulse time is saved to disk so a reboot or server restart
@@ -22,7 +27,7 @@ local function loadNext()
     f.close()
     if t then return t end
   end
-  return now() + INTERVAL_MINUTES * 60
+  return nil
 end
 
 local function saveNext(t)
@@ -44,28 +49,64 @@ local function draw(line)
   print(line)
 end
 
+local function parked()
+  return rs.getInput(PARKED_SIDE)
+end
+
+-- Wait for a redstone change, or until `seconds` pass. Returns true on timeout.
+local function waitRedstone(seconds)
+  local timer = os.startTimer(seconds)
+  while true do
+    local ev, id = os.pullEvent()
+    if ev == "redstone" then return false end
+    if ev == "timer" and id == timer then return true end
+  end
+end
+
+local function waitUntilParked()
+  draw("Machine moving, waiting for it to park...")
+  while not parked() do os.pullEvent("redstone") end
+  local nextAt = now() + INTERVAL_MINUTES * 60
+  saveNext(nextAt)
+  return nextAt
+end
+
+local function pulse()
+  rs.setOutput(OUTPUT_SIDE, true)
+  sleep(PULSE_SECONDS)
+  rs.setOutput(OUTPUT_SIDE, false)
+end
+
+-- Pulse until the machine leaves the contact.
+local function startMachine()
+  local tries = 0
+  while parked() do
+    tries = tries + 1
+    draw(tries == 1 and "Starting machine..." or ("Machine didn't start, retry " .. (tries - 1)))
+    pulse()
+    local deadline = now() + RETRY_SECONDS
+    while parked() and now() < deadline do
+      waitRedstone(math.max(0.05, deadline - now()))
+    end
+  end
+end
+
 rs.setOutput(OUTPUT_SIDE, false)
+
 local nextAt = loadNext()
-saveNext(nextAt)
+if not parked() or not nextAt then
+  nextAt = waitUntilParked()
+end
 
 while true do
-  if rs.getInput(STOP_SIDE) then
-    draw("Stopped: signal on " .. STOP_SIDE)
-    repeat os.pullEvent("redstone") until not rs.getInput(STOP_SIDE)
-    nextAt = now() + INTERVAL_MINUTES * 60
-    saveNext(nextAt)
+  if not parked() then
+    -- Moved by something other than this timer; restart the countdown once it parks.
+    nextAt = waitUntilParked()
   elseif now() >= nextAt then
-    draw("Pulsing " .. OUTPUT_SIDE)
-    rs.setOutput(OUTPUT_SIDE, true)
-    sleep(PULSE_SECONDS)
-    rs.setOutput(OUTPUT_SIDE, false)
-    nextAt = now() + INTERVAL_MINUTES * 60
-    saveNext(nextAt)
+    startMachine()
+    nextAt = waitUntilParked()
   else
-    draw("Next pulse in " .. fmt(nextAt - now()))
-    local timer = os.startTimer(1)
-    repeat
-      local ev, id = os.pullEvent()
-    until (ev == "timer" and id == timer) or ev == "redstone"
+    draw("Parked. Next start in " .. fmt(nextAt - now()))
+    waitRedstone(1)
   end
 end
