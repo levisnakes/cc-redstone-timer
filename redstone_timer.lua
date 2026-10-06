@@ -9,7 +9,7 @@
 INTERVAL_MINUTES = 5
 UNLOAD_TIMEOUT_MINUTES = 10
 -- Unloading counts as done once the vault hasn't gone up for this long
-SETTLE_SECONDS = 10
+SETTLE_SECONDS = 0.5
 OUTPUT_SIDE = "back"
 PARKED_SIDE = "top"
 
@@ -151,6 +151,15 @@ local function finishRun()
   save()
 end
 
+-- Quick total for the unload check: one list() call, about one tick.
+local function quickTotal()
+  local ok, items = pcall(peripheral.call, VAULT, "list")
+  if not ok or not items then return nil end
+  local total = 0
+  for _, item in pairs(items) do total = total + item.count end
+  return total
+end
+
 -- Sleep up to `seconds`, waking early for a force start.
 local function waitOrForce(seconds)
   local timer = os.startTimer(seconds)
@@ -170,9 +179,10 @@ local function waitForUnload()
   if not vault.ok then return true end
 
   while not forceRequested do
-    scanVault()
-    if vault.ok and vault.total > unload.peak then
-      unload.peak = vault.total
+    local total = quickTotal()
+    if total then vault.total = total end
+    if total and total > unload.peak then
+      unload.peak = total
       unload.started = true
       unload.lastUp = now()
     end
@@ -182,7 +192,8 @@ local function waitForUnload()
     if not unload.started and now() - unload.since >= UNLOAD_TIMEOUT_MINUTES * 60 then
       return false
     end
-    waitOrForce(2)
+    -- Check every tick so a short settle time is accurate
+    waitOrForce(0.05)
   end
   return true
 end
