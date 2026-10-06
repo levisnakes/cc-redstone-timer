@@ -1,10 +1,15 @@
 -- Tree Farm Timer: runs a machine that parks on a redstone contact and shows
 -- harvest stats on a monitor.
--- While parked, PARKED_SIDE is on. Every INTERVAL_MINUTES the timer turns
--- OUTPUT_SIDE on and holds it until the machine leaves the contact and comes
--- back (a new signal on PARKED_SIDE), then starts the next countdown.
+-- While parked, PARKED_SIDE is on. The timer turns OUTPUT_SIDE on and holds it
+-- until the machine leaves the contact and comes back. Then it waits for the
+-- harvest to finish unloading into the vault before starting the next
+-- INTERVAL_MINUTES countdown. If nothing arrives within UNLOAD_TIMEOUT_MINUTES,
+-- it runs the machine again.
 
-INTERVAL_MINUTES = 18
+INTERVAL_MINUTES = 5
+UNLOAD_TIMEOUT_MINUTES = 10
+-- Unloading counts as done once the vault hasn't gone up for this long
+SETTLE_SECONDS = 30
 OUTPUT_SIDE = "back"
 PARKED_SIDE = "top"
 
@@ -28,11 +33,16 @@ local state = {
   lastGain = nil,
   lastRunSeconds = nil,
   runStartTotal = nil,
+  reruns = 0,
+  unloading = false,
 }
 
 local phase = "parked"
 local runStartedAt = nil
 local forceRequested = false
+
+-- Progress of the current unload wait
+local unload = { since = 0, peak = 0, started = false, lastUp = 0 }
 
 local function load()
   if not fs.exists(SAVE) then return end
@@ -128,23 +138,67 @@ end
 local function startRun()
   phase = "running"
   runStartedAt = now()
-  if vault.ok then
-    if state.runStartTotal then
-      state.lastGain = math.max(0, vault.total - state.runStartTotal)
-    end
-    state.runStartTotal = vault.total
-  end
+  if vault.ok then state.runStartTotal = vault.total end
   rs.setOutput(OUTPUT_SIDE, true)
 end
 
 local function finishRun()
   rs.setOutput(OUTPUT_SIDE, false)
-  phase = "parked"
   if runStartedAt then
     state.lastRunSeconds = now() - runStartedAt
     state.cycles = state.cycles + 1
   end
-  state.nextAt = now() + INTERVAL_MINUTES * 60
+  state.unloading = true
+  save()
+end
+
+-- Sleep up to `seconds`, waking early for a force start.
+local function waitOrForce(seconds)
+  local timer = os.startTimer(seconds)
+  repeat
+    local ev, id = os.pullEvent()
+  until ev == "force_start" or (ev == "timer" and id == timer)
+end
+
+-- After parking, wait until the vault stops filling. Returns false if
+-- nothing arrived within the timeout. A force start ends the wait early.
+local function waitForUnload()
+  phase = "unloading"
+  scanVault()
+  unload = { since = now(), peak = vault.total, started = false, lastUp = now() }
+  if not vault.ok then return true end
+
+  while not forceRequested do
+    scanVault()
+    if vault.ok and vault.total > unload.peak then
+      unload.peak = vault.total
+      unload.started = true
+      unload.lastUp = now()
+    end
+    if unload.started and now() - unload.lastUp >= SETTLE_SECONDS then
+      return true
+    end
+    if not unload.started and now() - unload.since >= UNLOAD_TIMEOUT_MINUTES * 60 then
+      return false
+    end
+    waitOrForce(2)
+  end
+  return true
+end
+
+local function afterRun()
+  local unloaded = waitForUnload()
+  if state.runStartTotal then
+    state.lastGain = math.max(0, unload.peak - state.runStartTotal)
+  end
+  if unloaded then
+    state.nextAt = now() + INTERVAL_MINUTES * 60
+  else
+    state.reruns = state.reruns + 1
+    state.nextAt = now()
+  end
+  state.unloading = false
+  phase = "parked"
   save()
 end
 
@@ -156,8 +210,10 @@ local function timerLoop()
     rs.setOutput(OUTPUT_SIDE, true)
     waitForPark()
     rs.setOutput(OUTPUT_SIDE, false)
-    phase = "parked"
-    state.nextAt = nil
+    state.unloading = true
+  end
+  if state.unloading then
+    afterRun()
   end
   if not state.nextAt then
     state.nextAt = now() + INTERVAL_MINUTES * 60
@@ -171,7 +227,7 @@ local function timerLoop()
       while parked() do os.pullEvent("redstone") end
       waitForPark()
       finishRun()
-      forceRequested = false
+      afterRun()
     else
       local timer = os.startTimer(1)
       repeat
@@ -182,7 +238,7 @@ local function timerLoop()
 end
 
 local function forceStart()
-  if phase == "parked" then
+  if phase == "parked" or phase == "unloading" then
     forceRequested = true
     os.queueEvent("force_start")
   end
@@ -207,6 +263,12 @@ end
 local function status()
   if phase == "running" then
     return "HARVESTING", "Running for", fmtTime(now() - (runStartedAt or now())), nil
+  end
+  if phase == "unloading" then
+    if unload.started then
+      return "UNLOADING", "Unloaded so far", "+" .. math.max(0, unload.peak - (state.runStartTotal or unload.peak)), nil
+    end
+    return "WAITING", "Re-run if nothing in", fmtTime(UNLOAD_TIMEOUT_MINUTES * 60 - (now() - unload.since)), nil
   end
   local left = (state.nextAt or now()) - now()
   local frac = 1 - left / (INTERVAL_MINUTES * 60)
@@ -237,6 +299,7 @@ local AMBER = { 240, 170, 50 }
 local TRACK = { 50, 56, 66 }
 local WEDGE = { 40, 105, 60 }
 local RED = { 200, 70, 60 }
+local BLUE = { 70, 150, 230 }
 
 local function setupGpu()
   gpu = peripheral.find("directgpu")
@@ -312,7 +375,7 @@ local function drawClock(cx, cy, r, frac)
     end
     handFrac, handColor = frac, WHITE
   else
-    handFrac, handColor = (now() / 4) % 1, AMBER
+    handFrac, handColor = (now() / 4) % 1, phase == "unloading" and BLUE or AMBER
   end
 
   for i = 0, 11 do
@@ -345,7 +408,7 @@ local function drawGpu()
   rect(0, 0, W, headH, PANEL)
   text(TITLE, pad, pad, WHITE, medium, "bold")
   local label, caption, timeStr, frac = status()
-  local pillColor = phase == "running" and AMBER or GREEN
+  local pillColor = (phase == "running" and AMBER) or (phase == "unloading" and BLUE) or GREEN
   local pillW = textWidth(label, small, "bold") + pad * 2
   local pillH = small + pad
   rect(W - pad - pillW, (headH - pillH) / 2, pillW, pillH, pillColor)
@@ -427,7 +490,7 @@ local function drawPlain()
   end
   local label, caption, timeStr = status()
   line(1, TITLE)
-  line(2, label, phase == "running" and colours.orange or colours.lime)
+  line(2, label, (phase == "running" and colours.orange) or (phase == "unloading" and colours.lightBlue) or colours.lime)
   line(3, caption .. " " .. timeStr)
   mon.setCursorPos(2, 4)
   if phase == "running" then
@@ -469,6 +532,7 @@ local function drawTerminal()
   print(label .. ": " .. caption .. " " .. timeStr)
   print("")
   for _, s in ipairs(statLines()) do print(s[1] .. ": " .. s[2]) end
+  print("Re-runs (nothing unloaded): " .. state.reruns)
   print("")
   print("Press F or tap FORCE START to start now")
   if gpuError then
