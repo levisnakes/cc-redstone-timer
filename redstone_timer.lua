@@ -18,6 +18,23 @@ VAULT = "create:item_vault_37"
 TITLE = "TREE FARM"
 AUTO_UPDATE = true        -- install new versions from GitHub automatically, keeping these settings
 
+-- Settings in /config.lua override the ones above. Use it for anything you
+-- don't want to retype: it survives reinstalls and updates, and one file can
+-- be shared by every computer (each program ignores settings it doesn't use).
+do
+  local path = "/config.lua"
+  if fs.exists(path) then
+    local fn, err = loadfile(path, "t", _ENV)
+    if fn then
+      local ok, runErr = pcall(fn)
+      if not ok then printError("config.lua: " .. tostring(runErr)) sleep(3) end
+    else
+      printError("config.lua: " .. tostring(err))
+      sleep(3)
+    end
+  end
+end
+
 
 -- ===================== state =====================
 
